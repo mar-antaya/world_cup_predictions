@@ -29,12 +29,32 @@ import xgboost as xgb
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, log_loss, classification_report
+
+from player_features import (
+    SQUAD_FEATURES,
+    attach_squad_lookup,
+    build_squad_feature_lookup,
+    load_goalscorers,
+    load_squads,
+    squad_match_features,
+)
+from model_calibration import (
+    apply_draw_boost,
+    calibrate_model,
+    compute_draw_boost,
+    evaluate_probabilities,
+    print_reliability,
+)
+from prediction_log import log_prediction
+from goal_prediction import predict_goals
 
 warnings.filterwarnings("ignore")
 
 CACHE_DIR = "data_cache"
 RESULTS_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
+LOCAL_RESULTS_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "international_results", "results.csv")
+)
 FIXTURES_PATH = os.path.join(CACHE_DIR, "fixtures.csv")
 
 # normalizes the historical results.csv team names
@@ -59,7 +79,7 @@ FEATURES = [
     "home_win5", "away_win5", "home_gd5", "away_gd5",
     "home_win10", "away_win10", "home_rest_days", "away_rest_days",
     "h2h_n", "h2h_home_winrate", "h2h_home_gd",
-]
+] + SQUAD_FEATURES
 
 TRAIN_START = "2006-01-01"
 VAL_START = "2023-01-01"
@@ -83,7 +103,16 @@ plt.rcParams.update({
 
 
 # ── data loading ────────────────────────────────────────────────────────────────
-def fetch_results():
+def fetch_results(sync: bool = True):
+    if sync:
+        from sync_results import sync_results
+
+        path = sync_results()
+        return pd.read_csv(path)
+
+    if os.path.exists(LOCAL_RESULTS_PATH):
+        return pd.read_csv(LOCAL_RESULTS_PATH)
+
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, "results.csv")
     if not os.path.exists(path):
@@ -214,7 +243,7 @@ def split_by_date(ds, train_start, val_start, cutoff):
     return train, val
 
 
-def train_model(train, val):
+def train_model(train, val, calibrate: bool = True):
     X_train, y_train = train[FEATURES].astype(float), train["label"].astype(int)
     X_val, y_val = val[FEATURES].astype(float), val["label"].astype(int)
     model = xgb.XGBClassifier(
@@ -224,15 +253,30 @@ def train_model(train, val):
         tree_method="hist", n_jobs=-1, random_state=42,
     )
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-    return model, X_val, y_val
+    draw_boost = 1.0
+    if calibrate and len(val) > 0:
+        raw_proba = model.predict_proba(X_val)
+        evaluate_probabilities("Raw validation", y_val, raw_proba)
+        print_reliability("Raw", y_val, raw_proba)
+        model = calibrate_model(model, X_val, y_val)
+        cal_proba = model.predict_proba(X_val)
+        evaluate_probabilities("Calibrated validation", y_val, cal_proba)
+        print_reliability("Calibrated", y_val, cal_proba)
+        draw_boost = compute_draw_boost(y_val, cal_proba)
+        boosted = np.array(
+            [apply_draw_boost(r[0], r[1], r[2], draw_boost) for r in cal_proba]
+        )
+        actual_draw = float((np.asarray(y_val) == 1).mean())
+        print(
+            f"  Draw boost x{draw_boost:.2f}  "
+            f"(actual draws {actual_draw*100:.1f}% vs predicted {cal_proba[:,1].mean()*100:.1f}%)"
+        )
+        evaluate_probabilities("Draw-boosted validation", y_val, boosted)
+    return model, X_val, y_val, draw_boost
 
 
 def evaluate(model, X_val, y_val):
-    proba = model.predict_proba(X_val)
-    pred = proba.argmax(axis=1)
-    base = np.tile(np.bincount(y_val, minlength=3) / len(y_val), (len(y_val), 1))
-    print(f"  Validation accuracy : {accuracy_score(y_val, pred):.3f}")
-    print(f"  Validation log-loss : {log_loss(y_val, proba):.3f}  (baseline {log_loss(y_val, base, labels=[0,1,2]):.3f})")
+    evaluate_probabilities("Validation", y_val, model.predict_proba(X_val))
 
 
 # ── prediction helpers ──────────────────────────────────────────────────────────
@@ -253,7 +297,7 @@ def h2h_as_of(long, team, opp, asof):
     return float(len(sub)), float(sub["result"].mean()), float(sub["gd"].mean())
 
 
-def build_match_row(long, final_elo, home, away, neutral, weight, asof):
+def build_match_row(long, final_elo, home, away, neutral, weight, asof, squad_ctx=None):
     hf, af = form_as_of(long, home, asof), form_as_of(long, away, asof)
     he, ae = final_elo.get(home, ELO_BASE), final_elo.get(away, ELO_BASE)
     n, wr, gd = h2h_as_of(long, home, away, asof)
@@ -262,17 +306,30 @@ def build_match_row(long, final_elo, home, away, neutral, weight, asof):
            "home_gd5": hf["gd5"], "away_gd5": af["gd5"], "home_win10": hf["win10"],
            "away_win10": af["win10"], "home_rest_days": hf["rest_days"],
            "away_rest_days": af["rest_days"], "h2h_n": n, "h2h_home_winrate": wr, "h2h_home_gd": gd}
+    if squad_ctx is not None:
+        row.update(
+            squad_match_features(
+                squad_ctx["results"],
+                squad_ctx["goalscorers"],
+                squad_ctx["squads"],
+                home,
+                away,
+                asof,
+                club_stats=squad_ctx.get("club_stats"),
+            )
+        )
     return pd.DataFrame([row])[FEATURES].astype(float)
 
 
-def predict_symmetric(model, long, final_elo, a, b, asof, neutral, weight):
-    p_ab = model.predict_proba(build_match_row(long, final_elo, a, b, neutral, weight, asof))[0]
-    p_ba = model.predict_proba(build_match_row(long, final_elo, b, a, neutral, weight, asof))[0]
+def predict_symmetric(model, long, final_elo, a, b, asof, neutral, weight, squad_ctx=None, draw_boost=1.0):
+    p_ab = model.predict_proba(build_match_row(long, final_elo, a, b, neutral, weight, asof, squad_ctx))[0]
+    p_ba = model.predict_proba(build_match_row(long, final_elo, b, a, neutral, weight, asof, squad_ctx))[0]
     p_a = (p_ab[0] + p_ba[2]) / 2.0
     p_d = (p_ab[1] + p_ba[1]) / 2.0
     p_b = (p_ab[2] + p_ba[0]) / 2.0
     tot = p_a + p_d + p_b
-    return p_a / tot, p_d / tot, p_b / tot
+    p_a, p_d, p_b = p_a / tot, p_d / tot, p_b / tot
+    return apply_draw_boost(p_a, p_d, p_b, draw_boost)
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -317,21 +374,51 @@ def list_team_names():
 
 
 # ── chart ───────────────────────────────────────────────────────────────────────
-def make_chart(m, p_home, p_draw, p_away, slate_date, out_dir):
-    fig, ax = plt.subplots(figsize=(8, 4.8))
+def make_chart(m, p_home, p_draw, p_away, goals, slate_date, out_dir):
+    fig, (ax_prob, ax_xg) = plt.subplots(
+        2, 1, figsize=(8, 6.8), gridspec_kw={"height_ratios": [1.35, 1.0]}
+    )
+
     labels = [f"{m['home_disp']}\nwin", "Draw", f"{m['away_disp']}\nwin"]
     vals = [p_home, p_draw, p_away]
     colors = [ORANGE, GRAY, BLUE]
-    bars = ax.bar(labels, [v * 100 for v in vals], color=colors, width=0.62, zorder=3)
+    bars = ax_prob.bar(labels, [v * 100 for v in vals], color=colors, width=0.62, zorder=3)
     for b, v in zip(bars, vals):
-        ax.text(b.get_x() + b.get_width() / 2, v * 100 + 1.2, f"{v*100:.1f}%",
-                ha="center", va="bottom", fontsize=16, fontweight="bold")
-    ax.set_ylim(0, max(vals) * 100 + 12)
-    ax.set_ylabel("Win probability (%)")
+        ax_prob.text(
+            b.get_x() + b.get_width() / 2, v * 100 + 1.2, f"{v * 100:.1f}%",
+            ha="center", va="bottom", fontsize=15, fontweight="bold",
+        )
+    ax_prob.set_ylim(0, max(vals) * 100 + 12)
+    ax_prob.set_ylabel("Win probability (%)")
     sub = f"{slate_date}  ·  {m['group']}  ·  {m['stadium']}"
-    ax.set_title(f"{m['home_disp']} vs {m['away_disp']}\n{sub}", fontsize=13)
-    ax.yaxis.grid(True, color=GRID, zorder=0)
-    ax.set_axisbelow(True)
+    ax_prob.set_title(f"{m['home_disp']} vs {m['away_disp']}\n{sub}", fontsize=13)
+    ax_prob.yaxis.grid(True, color=GRID, zorder=0)
+    ax_prob.set_axisbelow(True)
+
+    xg_labels = [m["home_disp"], m["away_disp"]]
+    xg_vals = [goals["exp_home_goals"], goals["exp_away_goals"]]
+    xg_colors = [ORANGE, BLUE]
+    xg_bars = ax_xg.bar(xg_labels, xg_vals, color=xg_colors, width=0.55, zorder=3)
+    for b, v in zip(xg_bars, xg_vals):
+        ax_xg.text(
+            b.get_x() + b.get_width() / 2, v + 0.06, f"{v:.2f}",
+            ha="center", va="bottom", fontsize=14, fontweight="bold",
+        )
+    ax_xg.set_ylim(0, max(xg_vals) * 1.35 + 0.25)
+    ax_xg.set_ylabel("Opponent-adj. xG")
+    ax_xg.set_title(
+        f"Predicted score: {goals['pred_home_goals']}-{goals['pred_away_goals']}  "
+        f"({goals['scoreline_prob'] * 100:.1f}%)",
+        fontsize=11,
+    )
+    ax_xg.yaxis.grid(True, color=GRID, zorder=0)
+    ax_xg.set_axisbelow(True)
+    ax_xg.text(
+        0.99, 0.04,
+        f"O/U 2.5 {goals['over_2_5_prob'] * 100:.0f}%  ·  BTTS {goals['btts_prob'] * 100:.0f}%",
+        transform=ax_xg.transAxes, ha="right", va="bottom", fontsize=9, color=MUTE,
+    )
+
     fig.tight_layout()
     safe = f"{m['home_disp']}_vs_{m['away_disp']}".replace(" ", "_").replace("/", "-")
     path = os.path.join(out_dir, f"viz_{safe}.png")
@@ -367,8 +454,20 @@ def get_teams_from_args():
 def main():
     team_a, team_b = get_teams_from_args()
 
-    print("\nLoading data + building features ...")
+    print("\nSyncing latest match data ...")
+    print("Loading data + building features ...")
+    from sync_player_stats import sync_player_stats
+
     results = load_results()
+    goalscorers = load_goalscorers()
+    squads = load_squads()
+    club_stats = sync_player_stats()
+    squad_ctx = {
+        "results": results,
+        "goalscorers": goalscorers,
+        "squads": squads,
+        "club_stats": club_stats,
+    }
     dataset, final_elo = build_dataset(results)
     valid_teams = set(results["home_team"]) | set(results["away_team"])
     long = per_team_long(results)
@@ -384,20 +483,30 @@ def main():
         return
 
     match_date = m["date"]
-    print(f"Training model (data up to {match_date} ...")
+    print(f"Training model (data up to {match_date}) ...")
     train, val = split_by_date(dataset, TRAIN_START, VAL_START, match_date)
-    model, X_val, y_val = train_model(train, val)
+    print("Building historical squad features (2018+, pseudo-squads) ...")
+    lookup = build_squad_feature_lookup(
+        pd.concat([train, val], ignore_index=True), goalscorers
+    )
+    train = attach_squad_lookup(train, lookup)
+    val = attach_squad_lookup(val, lookup)
+    model, X_val, y_val, draw_boost = train_model(train, val)
 
     p_home, p_draw, p_away = predict_symmetric(
-        model, long, final_elo, m["home"], m["away"], match_date, MATCH_NEUTRAL, MATCH_WEIGHT)
+        model, long, final_elo, m["home"], m["away"], match_date, MATCH_NEUTRAL, MATCH_WEIGHT,
+        squad_ctx, draw_boost)
+    squad = squad_match_features(
+        results, goalscorers, squads, m["home"], m["away"], match_date, club_stats=club_stats)
     outcomes = [(m["home_disp"], p_home), ("Draw", p_draw), (m["away_disp"], p_away)]
     pick, conf = max(outcomes, key=lambda x: x[1])
     he, ae = final_elo.get(m["home"], ELO_BASE), final_elo.get(m["away"], ELO_BASE)
     tag = tag_match(conf, p_home, p_away, he, ae)
+    goals = predict_goals(long, m["home"], m["away"], match_date, MATCH_NEUTRAL, he, ae, final_elo)
 
     out_dir = os.path.join("predictions", str(match_date))
     os.makedirs(out_dir, exist_ok=True)
-    chart = make_chart(m, p_home, p_draw, p_away, match_date, out_dir)
+    chart = make_chart(m, p_home, p_draw, p_away, goals, match_date, out_dir)
 
     # print the single result
     print("\n" + "=" * 60)
@@ -409,8 +518,32 @@ def main():
     print(f"  {m['away_disp']:<22} win   {p_away*100:>5.1f}%")
     print("-" * 60)
     print(f"  PICK: {pick}  ({conf*100:.1f}%)   [{tag}]")
+    print("-" * 60)
+    print("  Predicted scoreline (Poisson):")
+    print(f"    Expected goals : {m['home_disp']} {goals['exp_home_goals']:.2f}  -  {goals['exp_away_goals']:.2f} {m['away_disp']}")
+    print(f"    Most likely    : {m['home_disp']} {goals['pred_home_goals']}-{goals['pred_away_goals']} {m['away_disp']}  ({goals['scoreline_prob']*100:.1f}%)")
+    print("    Top scorelines :", end="")
+    for i, (hg, ag, prob) in enumerate(goals["top_scores"]):
+        print(f"  {hg}-{ag} ({prob*100:.1f}%)", end="")
+    print()
+    print(f"    Over 2.5 goals : {goals['over_2_5_prob']*100:.1f}%   Both teams score : {goals['btts_prob']*100:.1f}%")
+    print("-" * 60)
+    print("  Squad form (last 10 intl matches, squad players):")
+    print(f"    {m['home_disp']:<22} goals {squad['home_squad_goals_l10']:>4.0f}  scorers {squad['home_squad_scorers_l10']:>4.0f}  top striker {squad['home_top_striker_goals_l10']:>4.0f}")
+    print(f"    {m['away_disp']:<22} goals {squad['away_squad_goals_l10']:>4.0f}  scorers {squad['away_squad_scorers_l10']:>4.0f}  top striker {squad['away_top_striker_goals_l10']:>4.0f}")
+    print("  Club form (last 90 days, squad players):")
+    print(f"    {m['home_disp']:<22} xG/90 {squad['home_squad_xg_per90_avg']:>5.2f}  starter mins {squad['home_starter_minutes_90d']:>5.0f}")
+    print(f"    {m['away_disp']:<22} xG/90 {squad['away_squad_xg_per90_avg']:>5.2f}  starter mins {squad['away_starter_minutes_90d']:>5.0f}")
     print("=" * 60)
-    print(f"  Chart saved -> {chart}\n")
+    print(f"  Chart saved -> {chart}")
+    log_path = log_prediction(
+        m, p_home, p_draw, p_away, pick, conf, tag, he, ae,
+        pred_home_goals=goals["pred_home_goals"],
+        pred_away_goals=goals["pred_away_goals"],
+        exp_home_goals=goals["exp_home_goals"],
+        exp_away_goals=goals["exp_away_goals"],
+    )
+    print(f"  Logged -> {log_path}\n")
 
 
 if __name__ == "__main__":
